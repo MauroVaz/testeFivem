@@ -1,3 +1,0 @@
---This empty file causes the scheduler.lua to load clientside
---scheduler.lua when loaded inside the sessionmanager resource currently manages remote callbacanon.
---Without this, callbacanon will only work server->client and not client->server.

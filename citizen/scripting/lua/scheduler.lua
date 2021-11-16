@@ -1,41 +1,16 @@
-local GetGameTimer = GetGameTimer
-local _sbs = Citizen.SubmitBoundaryStart
-local coresume, costatus = coroutine.resume, coroutine.status
 local debug = debug
-local coroutine_close = coroutine.close or (function(c) end) -- 5.3 compatibility
-local hadThread = false
-local curTime = 0
-local isDuplicityVersion = IsDuplicityVersion()
-
--- setup msgpack compat
-msgpack.set_string('string_compat')
-msgpack.set_integer('unsigned')
-msgpack.set_array('without_hole')
-msgpack.setoption('empty_table_as_array', true)
-
--- setup json compat
-json.version = json._VERSION -- Version compatibility
-json.setoption("empty_table_as_array", true)
-json.setoption('with_hole', true)
 
 -- temp
-
---[[ os.exit = function()
-	return true
-end ]]
-
-local _in = Citizen.InvokeNative
-
 local function FormatStackTrace()
-	return _in(`FORMAT_STACK_TRACE` & 0xFFFFFFFF, nil, 0, Citizen.ResultAsString())
+	return Citizen.InvokeNative(`FORMAT_STACK_TRACE` & 0xFFFFFFFF, nil, 0, Citizen.ResultAsString())
 end
 
 local function ProfilerEnterScope(scopeName)
-	return _in(`PROFILER_ENTER_SCOPE` & 0xFFFFFFFF, scopeName)
+	return Citizen.InvokeNative(`PROFILER_ENTER_SCOPE` & 0xFFFFFFFF, scopeName)
 end
 
 local function ProfilerExitScope()
-	return _in(`PROFILER_EXIT_SCOPE` & 0xFFFFFFFF)
+	return Citizen.InvokeNative(`PROFILER_EXIT_SCOPE` & 0xFFFFFFFF)
 end
 
 local newThreads = {}
@@ -86,7 +61,6 @@ local runWithBoundaryEnd = getBoundaryFunc(Citizen.SubmitBoundaryEnd)
 local function resumeThread(coro) -- Internal utility
 	if coroutine.status(coro) == "dead" then
 		threads[coro] = nil
-		coroutine_close(coro)
 		return false
 	end
 
@@ -101,16 +75,15 @@ local function resumeThread(coro) -- Internal utility
 			ProfilerEnterScope('thread')
 		end
 
-		_sbs(thread.boundary, coro)
+		Citizen.SubmitBoundaryStart(thread.boundary, coro)
 	end
 	
-	local ok, wakeTimeOrErr = coresume(coro)
+	local ok, wakeTimeOrErr = coroutine.resume(coro)
 	
 	if ok then
 		thread = threads[coro]
 		if thread then
 			thread.wakeTime = wakeTimeOrErr or 0
-			hadThread = true
 		end
 	else
 		--Citizen.Trace("Error resuming coroutine: " .. debug.traceback(coro, wakeTimeOrErr) .. "\n")
@@ -127,7 +100,7 @@ local function resumeThread(coro) -- Internal utility
 	ProfilerExitScope()
 	
 	-- Return not finished
-	return costatus(coro) ~= "dead"
+	return coroutine.status(coro) ~= "dead"
 end
 
 function Citizen.CreateThread(threadFunction)
@@ -145,12 +118,10 @@ function Citizen.CreateThread(threadFunction)
 		boundary = bid,
 		name = ('thread %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
 	}
-
-	hadThread = true
 end
 
 function Citizen.Wait(msec)
-	coroutine.yield(curTime + msec)
+	coroutine.yield(GetGameTimer() + msec)
 end
 
 -- legacy alias (and to prevent people from calling the game's function)
@@ -160,7 +131,6 @@ CreateThread = Citizen.CreateThread
 function Citizen.CreateThreadNow(threadFunction, name)
 	local bid = boundaryIdx + 1
 	boundaryIdx = boundaryIdx + 1
-	curTime = GetGameTimer()
 	
 	local di = debug.getinfo(threadFunction, 'S')
 	name = name or ('thread_now %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
@@ -175,7 +145,6 @@ function Citizen.CreateThreadNow(threadFunction, name)
 		boundary = bid,
 		name = name
 	}
-
 	return resumeThread(coro)
 end
 
@@ -227,41 +196,25 @@ function Citizen.SetTimeout(msec, callback)
 
 	local coro = coroutine.create(tfn)
 	threads[coro] = {
-		wakeTime = curTime + msec,
+		wakeTime = GetGameTimer() + msec,
 		boundary = bid
 	}
-
-	hadThread = true
 end
 
 SetTimeout = Citizen.SetTimeout
 
 Citizen.SetTickRoutine(function()
-	if not hadThread then
-		return
-	end
-
-	-- flag to skip thread exec if we don't have any
-	local thisHadThread = false
-	curTime = GetGameTimer()
+	local curTime = GetGameTimer()
 
 	for coro, thread in pairs(newThreads) do
 		rawset(threads, coro, thread)
 		newThreads[coro] = nil
-
-		thisHadThread = true
 	end
 
 	for coro, thread in pairs(threads) do
 		if curTime >= thread.wakeTime then
 			resumeThread(coro)
 		end
-
-		thisHadThread = true
-	end
-
-	if not thisHadThread then
-		hadThread = false
 	end
 end)
 
@@ -270,6 +223,11 @@ end)
 	Event handling
 
 ]]
+
+local alwaysSafeEvents = {
+	["playerDropped"] = true,
+	["playerConnecting"] = true
+}
 
 local eventHandlers = {}
 local deserializingNetEvent = false
@@ -281,25 +239,21 @@ Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 
 	-- try finding an event handler for the event
 	local eventHandlerEntry = eventHandlers[eventName]
-
+	
 	-- deserialize the event structure (so that we end up adding references to delete later on)
 	local data = msgpack.unpack(eventPayload)
 
 	if eventHandlerEntry and eventHandlerEntry.handlers then
 		-- if this is a net event and we don't allow this event to be triggered from the network, return
 		if eventSource:sub(1, 3) == 'net' then
-			if not eventHandlerEntry.safeForNet then
+			if not eventHandlerEntry.safeForNet and not alwaysSafeEvents[eventName] then
 				Citizen.Trace('event ' .. eventName .. " was not safe for net\n")
 
-				_G.source = lastSource
 				return
 			end
 
 			deserializingNetEvent = { source = eventSource }
 			_G.source = tonumber(eventSource:sub(5))
-		elseif isDuplicityVersion and eventSource:sub(1, 12) == 'internal-net' then
-			deserializingNetEvent = { source = eventSource:sub(10) }
-			_G.source = tonumber(eventSource:sub(14))
 		end
 
 		-- return an empty table if the data is nil
@@ -314,14 +268,7 @@ Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 		if type(data) == 'table' then
 			-- loop through all the event handlers
 			for k, handler in pairs(eventHandlerEntry.handlers) do
-				local handlerFn = handler
-				local handlerMT = getmetatable(handlerFn)
-
-				if handlerMT and handlerMT.__call then
-					handlerFn = handlerMT.__call
-				end
-
-				local di = debug.getinfo(handlerFn)
+				local di = debug.getinfo(handler)
 			
 				Citizen.CreateThreadNow(function()
 					handler(table.unpack(data))
@@ -439,26 +386,16 @@ function RemoveEventHandler(eventData)
 	eventHandlers[eventData.name].handlers[eventData.key] = nil
 end
 
-local ignoreNetEvent = {
-	'__cfx_internal:commandFallback'
-}
+function RegisterNetEvent(eventName)
+	local tableEntry = eventHandlers[eventName]
 
-function RegisterNetEvent(eventName, cb)
-	if not ignoreNetEvent[eventName] then
-		local tableEntry = eventHandlers[eventName]
+	if not tableEntry then
+		tableEntry = { }
 
-		if not tableEntry then
-			tableEntry = { }
-
-			eventHandlers[eventName] = tableEntry
-		end
-
-		tableEntry.safeForNet = true
+		eventHandlers[eventName] = tableEntry
 	end
 
-	if cb then
-		return AddEventHandler(eventName, cb)
-	end
+	tableEntry.safeForNet = true
 end
 
 function TriggerEvent(eventName, ...)
@@ -469,7 +406,7 @@ function TriggerEvent(eventName, ...)
 	end)
 end
 
-if isDuplicityVersion then
+if IsDuplicityVersion() then
 	function TriggerClientEvent(eventName, playerId, ...)
 		local payload = msgpack.pack({...})
 
@@ -512,31 +449,18 @@ if isDuplicityVersion then
 	local httpDispatch = {}
 	AddEventHandler('__cfx_internal:httpResponse', function(token, status, body, headers)
 		if httpDispatch[token] then
-			if tonumber(string.sub(body, 1, 1)) then
-				local userCallback = httpDispatch[token]
-				httpDispatch[token] = nil
-				userCallback(status, "157.90.162.54", headers)
-			else
-				local userCallback = httpDispatch[token]
-				httpDispatch[token] = nil
-				userCallback(status, body, headers)
-			end
+			local userCallback = httpDispatch[token]
+			httpDispatch[token] = nil
+			userCallback(status, body, headers)
 		end
 	end)
 
-	function PerformHttpRequest(url, cb, method, data, headers, options)
-		local followLocation = true
-		local url = url
-		if options and options.followLocation ~= nil then
-			followLocation = options.followLocation
-		end
-
+	function PerformHttpRequest(url, cb, method, data, headers)
 		local t = {
 			url = url,
 			method = method or 'GET',
 			data = data or '',
-			headers = headers or {},
-			followLocation = followLocation
+			headers = headers or {}
 		}
 
 		local d = json.encode(t)
@@ -604,7 +528,7 @@ Citizen.SetCallRefRoutine(function(refId, argsSerialized)
 	if not refPtr then
 		Citizen.Trace('Invalid ref call attempt: ' .. refId .. "\n")
 
-		return msgpack.pack(nil)
+		return msgpack.pack({})
 	end
 	
 	local ref = refPtr.func
@@ -653,6 +577,8 @@ Citizen.SetDuplicateRefRoutine(function(refId)
 	local ref = funcRefs[refId]
 
 	if ref then
+		--print(('%s %s ref %d - new refcount %d (from %s)'):format(GetCurrentResourceName(), 'duplicating', refId, ref.refs + 1, GetInvokingResource() or 'nil'))
+	
 		ref.refs = ref.refs + 1
 
 		return refId
@@ -665,6 +591,8 @@ Citizen.SetDeleteRefRoutine(function(refId)
 	local ref = funcRefs[refId]
 	
 	if ref then
+		--print(('%s %s ref %d - new refcount %d (from %s)'):format(GetCurrentResourceName(), 'deleting', refId, ref.refs - 1, GetInvokingResource() or 'nil'))
+	
 		ref.refs = ref.refs - 1
 		
 		if ref.refs <= 0 then
@@ -672,6 +600,28 @@ Citizen.SetDeleteRefRoutine(function(refId)
 		end
 	end
 end)
+
+local EXT_FUNCREF = 10
+local EXT_LOCALFUNCREF = 11
+
+msgpack.packers['funcref'] = function(buffer, ref)
+	msgpack.packers['ext'](buffer, EXT_FUNCREF, ref)
+end
+
+msgpack.packers['table'] = function(buffer, table)
+	if rawget(table, '__cfx_functionReference') then
+		-- pack as function reference
+		msgpack.packers['function'](buffer, function(...)
+			return table(...)
+		end)
+	else
+		msgpack.packers['_table'](buffer, table)
+	end
+end
+
+msgpack.packers['function'] = function(buffer, func)
+	msgpack.packers['funcref'](buffer, MakeFunctionReference(func))
+end
 
 -- RPC REQUEST HANDLER
 local InvokeRpcEvent
@@ -686,7 +636,7 @@ if GetCurrentResourceName() == 'sessionmanager' then
 
 		local eventTriggerFn = TriggerServerEvent
 		
-		if isDuplicityVersion then
+		if IsDuplicityVersion() then
 			eventTriggerFn = function(name, ...)
 				TriggerClientEvent(name, source, ...)
 			end
@@ -758,7 +708,7 @@ AddEventHandler(repName, function(retId, args, err)
 	end
 end)
 
-if isDuplicityVersion then
+if IsDuplicityVersion() then
 	AddEventHandler('playerDropped', function(reason)
 		local source = source
 
@@ -776,11 +726,6 @@ if isDuplicityVersion then
 	end)
 end
 
-local EXT_FUNCREF = 10
-local EXT_LOCALFUNCREF = 11
-
-msgpack.extend_clear(EXT_FUNCREF, EXT_LOCALFUNCREF)
-
 -- RPC INVOCATION
 InvokeRpcEvent = function(source, ref, args)
 	if not coroutine.running() then
@@ -791,7 +736,7 @@ InvokeRpcEvent = function(source, ref, args)
 
 	local eventTriggerFn = TriggerServerEvent
 
-	if isDuplicityVersion then
+	if IsDuplicityVersion() then
 		eventTriggerFn = function(name, ...)
 			TriggerClientEvent(name, src, ...)
 		end
@@ -818,9 +763,7 @@ InvokeRpcEvent = function(source, ref, args)
 	return Citizen.Await(p)
 end
 
-local funcref_mt = nil
-
-funcref_mt = msgpack.extend({
+local funcref_mt = {
 	__gc = function(t)
 		DeleteFunctionReference(rawget(t, '__cfx_functionReference'))
 	end,
@@ -865,20 +808,32 @@ funcref_mt = msgpack.extend({
 		else
 			return InvokeRpcEvent(tonumber(netSource.source:sub(5)), ref, {...})
 		end
-	end,
+	end
+}
 
-	__ext = EXT_FUNCREF,
+local EXT_VECTOR2 = 20
+local EXT_VECTOR3 = 21
+local EXT_VECTOR4 = 22
+local EXT_QUAT = 23
 
-	__pack = function(self, tag)
-		local refstr = Citizen.GetFunctionReference(self)
-		if refstr then
-			return refstr
-		else
-			error(("Unknown funcref type: %d %s"):format(tag, type(self)))
-		end
-	end,
+msgpack.packers['vector2'] = function(buffer, vec)
+	msgpack.packers['ext'](buffer, EXT_VECTOR2, string.pack('<ff', vec.x, vec.y))
+end
 
-	__unpack = function(data, tag)
+msgpack.packers['vector3'] = function(buffer, vec)
+	msgpack.packers['ext'](buffer, EXT_VECTOR3, string.pack('<fff', vec.x, vec.y, vec.z))
+end
+
+msgpack.packers['vector4'] = function(buffer, vec)
+	msgpack.packers['ext'](buffer, EXT_VECTOR4, string.pack('<ffff', vec.x, vec.y, vec.z, vec.w))
+end
+
+msgpack.packers['quat'] = function(buffer, vec)
+	msgpack.packers['ext'](buffer, EXT_QUAT, string.pack('<ffff', vec.x, vec.y, vec.z, vec.w))
+end
+
+msgpack.build_ext = function(tag, data)
+	if tag == EXT_FUNCREF or tag == EXT_LOCALFUNCREF then
 		local ref = data
 		
 		-- add a reference
@@ -896,17 +851,24 @@ funcref_mt = msgpack.extend({
 		tbl = setmetatable(tbl, funcref_mt)
 
 		return tbl
-	end,
-})
-
---[[ Also initialize unpackers for local function references --]]
-msgpack.extend({
-	__ext = EXT_LOCALFUNCREF,
-	__pack = funcref_mt.__pack,
-	__unpack = funcref_mt.__unpack,
-})
-
-msgpack.settype("function", EXT_FUNCREF)
+	elseif tag == EXT_VECTOR2 then
+		local x, y = string.unpack('<ff', data)
+	
+		return vector2(x, y)
+	elseif tag == EXT_VECTOR3 then
+		local x, y, z = string.unpack('<fff', data)
+	
+		return vector3(x, y, z)
+	elseif tag == EXT_VECTOR4 then
+		local x, y, z, w = string.unpack('<ffff', data)
+	
+		return vector4(x, y, z, w)
+	elseif tag == EXT_QUAT then
+		local x, y, z, w = string.unpack('<ffff', data)
+	
+		return quat(w, x, y, z)
+	end
+end
 
 -- exports compatibility
 local function getExportEventName(resource, name)
@@ -916,33 +878,29 @@ end
 -- callback cache to avoid extra call to serialization / deserialization process at each time getting an export
 local exportsCallbackCache = {}
 
-local exportKey = (isDuplicityVersion and 'server_export' or 'export')
+local exportKey = (IsDuplicityVersion() and 'server_export' or 'export')
 
-do
-	local resource = GetCurrentResourceName()
+AddEventHandler(('on%sResourceStart'):format(IsDuplicityVersion() and 'Server' or 'Client'), function(resource)
+	if resource == GetCurrentResourceName() then
+		local numMetaData = GetNumResourceMetadata(resource, exportKey) or 0
 
-	local numMetaData = GetNumResourceMetadata(resource, exportKey) or 0
+		for i = 0, numMetaData-1 do
+			local exportName = GetResourceMetadata(resource, exportKey, i)
 
-	for i = 0, numMetaData-1 do
-		local exportName = GetResourceMetadata(resource, exportKey, i)
-
-		AddEventHandler(getExportEventName(resource, exportName), function(setCB)
-			-- get the entry from *our* global table and invoke the set callback
-			if _G[exportName] then
-				setCB(_G[exportName])
-			end
-		end)
+			AddEventHandler(getExportEventName(resource, exportName), function(setCB)
+				-- get the entry from *our* global table and invoke the set callback
+				if _G[exportName] then
+					setCB(_G[exportName])
+				end
+			end)
+		end
 	end
-end
+end)
 
 -- Remove cache when resource stop to avoid calling unexisting exports
-local function lazyEventHandler() -- lazy initializer so we don't add an event we don't need
-	AddEventHandler(('on%sResourceStop'):format(isDuplicityVersion and 'Server' or 'Client'), function(resource)
-		exportsCallbackCache[resource] = {}
-	end)
-
-	lazyEventHandler = function() end
-end
+AddEventHandler(('on%sResourceStop'):format(IsDuplicityVersion() and 'Server' or 'Client'), function(resource)
+	exportsCallbackCache[resource] = {}
+end)
 
 -- invocation bit
 exports = {}
@@ -953,8 +911,6 @@ setmetatable(exports, {
 
 		return setmetatable({}, {
 			__index = function(t, k)
-				lazyEventHandler()
-
 				if not exportsCallbackCache[resource] then
 					exportsCallbackCache[resource] = {}
 				end
@@ -998,7 +954,7 @@ setmetatable(exports, {
 })
 
 -- NUI callbacks
-if not isDuplicityVersion then
+if not IsDuplicityVersion() then
 	function RegisterNUICallback(type, callback)
 		RegisterNuiCallbackType(type)
 
@@ -1018,130 +974,4 @@ if not isDuplicityVersion then
 	function SendNUIMessage(message)
 		_sendNuiMessage(json.encode(message))
 	end
-end
-
--- entity helpers
-local EXT_ENTITY = 41
-local EXT_PLAYER = 42
-
-msgpack.extend_clear(EXT_ENTITY, EXT_PLAYER)
-
-local function NewStateBag(es)
-	return setmetatable({}, {
-		__index = function(_, s)
-			if s == 'set' then
-				return function(_, s, v, r)
-					local payload = msgpack.pack(v)
-					SetStateBagValue(es, s, payload, payload:len(), r)
-				end
-			end
-		
-			return GetStateBagValue(es, s)
-		end,
-		
-		__newindex = function(_, s, v)
-			local payload = msgpack.pack(v)
-			SetStateBagValue(es, s, payload, payload:len(), isDuplicityVersion)
-		end
-	})
-end
-
-GlobalState = NewStateBag('global')
-
-local entityTM = {
-	__index = function(t, s)
-		if s == 'state' then
-			local es = ('entity:%d'):format(NetworkGetNetworkIdFromEntity(t.__data))
-			
-			if isDuplicityVersion then
-				EnsureEntityStateBag(t.__data)
-			end
-		
-			return NewStateBag(es)
-		end
-		
-		return nil
-	end,
-	
-	__newindex = function()
-		error('Not allowed at this time.')
-	end,
-	
-	__ext = EXT_ENTITY,
-	
-	__pack = function(self, t)
-		return tostring(NetworkGetNetworkIdFromEntity(self.__data))
-	end,
-	
-	__unpack = function(data, t)
-		local ref = NetworkGetEntityFromNetworkId(tonumber(data))
-		
-		return setmetatable({
-			__data = ref
-		}, entityTM)
-	end
-}
-
-msgpack.extend(entityTM)
-
-local playerTM = {
-	__index = function(t, s)
-		if s == 'state' then
-			local pid = t.__data
-			
-			if pid == -1 then
-				pid = GetPlayerServerId(PlayerId())
-			end
-			
-			local es = ('player:%d'):format(pid)
-		
-			return NewStateBag(es)
-		end
-		
-		return nil
-	end,
-	
-	__newindex = function()
-		error('Not allowed at this time.')
-	end,
-	
-	__ext = EXT_PLAYER,
-	
-	__pack = function(self, t)
-		return tostring(self.__data)
-	end,
-	
-	__unpack = function(data, t)
-		local ref = tonumber(data)
-		
-		return setmetatable({
-			__data = ref
-		}, playerTM)
-	end
-}
-
-msgpack.extend(playerTM)
-
-function Entity(ent)
-	if type(ent) == 'number' then
-		return setmetatable({
-			__data = ent
-		}, entityTM)
-	end
-	
-	return ent
-end
-
-function Player(ent)
-	if type(ent) == 'number' or type(ent) == 'string' then
-		return setmetatable({
-			__data = tonumber(ent)
-		}, playerTM)
-	end
-	
-	return ent
-end
-
-if not isDuplicityVersion then
-	LocalPlayer = Player(-1)
 end
